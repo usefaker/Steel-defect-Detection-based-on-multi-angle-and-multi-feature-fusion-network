@@ -1,0 +1,6 @@
+path: D:\yolov5-test\yolov5-master\yolov5-master\mydata
+train: images/train
+val: images/val
+
+nc: 6
+names: ["crazing","inclusion","patches","pitted_surface","rolled-in_scale","scratches"]
