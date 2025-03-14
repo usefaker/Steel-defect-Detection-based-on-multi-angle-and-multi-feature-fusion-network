@@ -5,7 +5,7 @@ YOLO-specific modules
 Usage:
     $ python models/yolo.py --cfg yolov5s.yaml
 """
-
+import timm
 import argparse
 import contextlib
 import os
@@ -21,9 +21,7 @@ if str(ROOT) not in sys.path:
 if platform.system() != 'Windows':
     ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-from models.BiFormer import BiLevelRoutingAttention, Attention,AttentionLePE
-from models.CBAM import ChannelAttention, SpatialAttention, CBAMBlock
-from models.efficiencyse import SEAttention
+
 from models.common import *
 from models.experimental import *
 from utils.autoanchor import check_anchor_order
@@ -207,6 +205,7 @@ class DetectionModel(BaseModel):
         initialize_weights(self)
         self.info()
         LOGGER.info('')
+        DetectionModel
 
     def forward(self, x, augment=False, profile=False, visualize=False):
         if augment:
@@ -320,14 +319,14 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
 
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
         if m in {
-                Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
-                BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x, C3_Res2Block, C3_DBB}:
+            Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
+            BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x, C3_Res2Block, C3_DBB, C3_DCN}:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, 8)
 
             args = [c1, c2, *args[1:]]
-            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x, C3_Res2Block, C3_DBB}:
+            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x, C3_Res2Block, C3_DBB, C3_DCN}:
                 args.insert(2, n)  # number of repeats
                 n = 1
         elif m is nn.BatchNorm2d:
@@ -345,15 +344,21 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             c2 = ch[f] * args[0] ** 2
         elif m is Expand:
             c2 = ch[f] // args[0] ** 2
-        elif m in {BiLevelRoutingAttention,Attention,AttentionLePE}:
-            c2 = ch[f]
-            args = [c2, *args]
-        elif m in {ChannelAttention, SpatialAttention, CBAMBlock}:
-            c2 = ch[f]
-            args = [ch[f], *args]
-        elif m in {SEAttention}:
-            c2 = ch[f]
-            args = [ch[f], *args]
+        elif m is Zoom_cat:
+            c2 = sum(ch[x] for x in f)
+        elif m is Add:
+            c2 = ch[f[-1]]
+        elif m is attention_model:
+            c2 = ch[f[-1]]
+            args = [c2]
+        elif m is ScalSeq:
+            c1 = [ch[x] for x in f]
+            c2 = make_divisible(args[0] * gw, 8)
+            args = [c1, c2]
+        elif m in {ContextGuideFusionModule}:
+            c1 = [ch[x] for x in f]
+            c2 = 2 * c1[1]
+            args = [c1]
         else:
             c2 = ch[f]
 
@@ -376,8 +381,8 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=1, help='total batch size for all GPUs')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--profile', action='store_true', help='profile model speed')
-    parser.add_argument('--line-profile', action='store_true',default=True, help='profile model speed layer by layer')
-    parser.add_argument('--test', action='store_true',default=True, help='test all yolo*.yaml')
+    parser.add_argument('--line-profile', action='store_true', default=True, help='profile model speed layer by layer')
+    parser.add_argument('--test', action='store_true', default=True, help='test all yolo*.yaml')
     opt = parser.parse_args()
     opt.cfg = check_yaml(opt.cfg)  # check YAML
     print_args(vars(opt))

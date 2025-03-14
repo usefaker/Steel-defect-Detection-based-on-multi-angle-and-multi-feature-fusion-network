@@ -1235,3 +1235,279 @@ class C3_DBB(C3):
         super().__init__(c1, c2, n, shortcut, g, e)
         c_ = int(c2 * e)  # hidden channels
         self.m = nn.Sequential(*(Bottleneck_DBB(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+
+
+# common.py
+import torch.nn.functional as F
+
+
+class Zoom_cat(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        """l,m,s表示大中小三个尺度，最终会被整合到m这个尺度上"""
+        l, m, s = x[0], x[1], x[2]
+        tgt_size = m.shape[2:]
+        l = F.adaptive_max_pool2d(l, tgt_size) + F.adaptive_avg_pool2d(l, tgt_size)
+        s = F.interpolate(s, m.shape[2:], mode='nearest')
+        lms = torch.cat([l, m, s], dim=1)
+        return lms
+
+
+class ScalSeq(nn.Module):
+    def __init__(self, inc, channel):
+        super(ScalSeq, self).__init__()
+        self.conv1 = Conv(inc[1], channel, 1)
+        self.conv2 = Conv(inc[2], channel, 1)
+        self.conv3d = nn.Conv3d(channel, channel, kernel_size=(1, 1, 1))
+        self.bn = nn.BatchNorm3d(channel)
+        self.act = nn.LeakyReLU(0.1)
+        self.pool_3d = nn.MaxPool3d(kernel_size=(3, 1, 1))
+
+    def forward(self, x):
+        p3, p4, p5 = x[0], x[1], x[2]
+        p4_2 = self.conv1(p4)
+        p4_2 = F.interpolate(p4_2, p3.size()[2:], mode='nearest')
+        p5_2 = self.conv2(p5)
+        p5_2 = F.interpolate(p5_2, p3.size()[2:], mode='nearest')
+        p3_3d = torch.unsqueeze(p3, -3)
+        p4_3d = torch.unsqueeze(p4_2, -3)
+        p5_3d = torch.unsqueeze(p5_2, -3)
+        combine = torch.cat([p3_3d, p4_3d, p5_3d], dim=2)
+        conv_3d = self.conv3d(combine)
+        bn = self.bn(conv_3d)
+        act = self.act(bn)
+        x = self.pool_3d(act)
+        x = torch.squeeze(x, 2)
+        return x
+
+
+class Add(nn.Module):
+    # Concatenate a list of tensors along dimension
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        input1, input2 = x[0], x[1]
+        x = input1 + input2
+        return x
+
+
+class channel_att(nn.Module):
+    def __init__(self, channel, b=1, gamma=2):
+        super(channel_att, self).__init__()
+        kernel_size = int(abs((math.log(channel, 2) + b) / gamma))
+        kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1
+
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=kernel_size, padding=(kernel_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = y.squeeze(-1)
+        y = y.transpose(-1, -2)
+        y = self.conv(y).transpose(-1, -2).unsqueeze(-1)
+        y = self.sigmoid(y)
+        return x * y.expand_as(x)
+
+
+class local_att(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(local_att, self).__init__()
+
+        self.conv_1x1 = nn.Conv2d(in_channels=channel, out_channels=channel // reduction, kernel_size=1, stride=1,
+                                  bias=False)
+
+        self.relu = nn.ReLU()
+        self.bn = nn.BatchNorm2d(channel // reduction)
+
+        self.F_h = nn.Conv2d(in_channels=channel // reduction, out_channels=channel, kernel_size=1, stride=1,
+                             bias=False)
+        self.F_w = nn.Conv2d(in_channels=channel // reduction, out_channels=channel, kernel_size=1, stride=1,
+                             bias=False)
+
+        self.sigmoid_h = nn.Sigmoid()
+        self.sigmoid_w = nn.Sigmoid()
+
+    def forward(self, x):
+        _, _, h, w = x.size()
+
+        x_h = torch.mean(x, dim=3, keepdim=True).permute(0, 1, 3, 2)
+        x_w = torch.mean(x, dim=2, keepdim=True)
+
+        x_cat_conv_relu = self.relu(self.bn(self.conv_1x1(torch.cat((x_h, x_w), 3))))
+
+        x_cat_conv_split_h, x_cat_conv_split_w = x_cat_conv_relu.split([h, w], 3)
+
+        s_h = self.sigmoid_h(self.F_h(x_cat_conv_split_h.permute(0, 1, 3, 2)))
+        s_w = self.sigmoid_w(self.F_w(x_cat_conv_split_w))
+
+        out = x * s_h.expand_as(x) * s_w.expand_as(x)
+        return out
+
+
+class attention_model(nn.Module):
+    # Concatenate a list of tensors along dimension
+    def __init__(self, ch=256):
+        super().__init__()
+        self.channel_att = channel_att(ch)
+        self.local_att = local_att(ch)
+
+    def forward(self, x):
+        input1, input2 = x[0], x[1]
+        input1 = self.channel_att(input1)
+        x = input1 + input2
+        x = self.local_att(x)
+        return x
+
+
+class DCNv2(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1,
+                 padding=1, dilation=1, groups=1, deformable_groups=1):
+        super(DCNv2, self).__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = (kernel_size, kernel_size)
+        self.stride = (stride, stride)
+        self.padding = (padding, padding)
+        self.dilation = (dilation, dilation)
+        self.groups = groups
+        self.deformable_groups = deformable_groups
+
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels, *self.kernel_size)
+        )
+        self.bias = nn.Parameter(torch.empty(out_channels))
+
+        out_channels_offset_mask = (self.deformable_groups * 3 *
+                                    self.kernel_size[0] * self.kernel_size[1])
+        self.conv_offset_mask = nn.Conv2d(
+            self.in_channels,
+            out_channels_offset_mask,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.padding,
+            bias=True,
+        )
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.act = Conv.default_act
+        self.reset_parameters()
+
+    def forward(self, x):
+        offset_mask = self.conv_offset_mask(x)
+        o1, o2, mask = torch.chunk(offset_mask, 3, dim=1)
+        offset = torch.cat((o1, o2), dim=1)
+        mask = torch.sigmoid(mask)
+        x = torch.ops.torchvision.deform_conv2d(
+            x,
+            self.weight,
+            offset,
+            mask,
+            self.bias,
+            self.stride[0], self.stride[1],
+            self.padding[0], self.padding[1],
+            self.dilation[0], self.dilation[1],
+            self.groups,
+            self.deformable_groups,
+            True
+        )
+        x = self.bn(x)
+        x = self.act(x)
+        return x
+
+    def reset_parameters(self):
+        n = self.in_channels
+        for k in self.kernel_size:
+            n *= k
+        std = 1. / math.sqrt(n)
+        self.weight.data.uniform_(-std, std)
+        self.bias.data.zero_()
+        self.conv_offset_mask.weight.data.zero_()
+        self.conv_offset_mask.bias.data.zero_()
+
+class Bottleneck_DCN(nn.Module):
+    # Standard bottleneck
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = DCNv2(c_, c2, 3, 1, groups=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+class C3_DCN(C3):
+    # C3 module with DCNv2
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+        self.m = nn.Sequential(*(Bottleneck_DCN(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+
+
+class SEAttention(nn.Module):
+
+    def __init__(self, channel=512, reduction=16):
+        super().__init__()
+        # 在空间维度上,将H×W压缩为1×1
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        # 包含两层全连接,先降维,后升维。最后接一个sigmoid函数
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                init.kaiming_normal_(m.weight, mode='fan_out')
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                init.constant_(m.weight, 1)
+                init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                init.normal_(m.weight, std=0.001)
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        # (B,C,H,W)
+        B, C, H, W = x.size()
+        # Squeeze: (B,C,H,W)-->avg_pool-->(B,C,1,1)-->view-->(B,C)
+        y = self.avg_pool(x).view(B, C)
+        # Excitation: (B,C)-->fc-->(B,C)-->(B, C, 1, 1)
+        y = self.fc(y).view(B, C, 1, 1)
+        # scale: (B,C,H,W) * (B, C, 1, 1) == (B,C,H,W)
+        out = x * y
+        return out
+
+
+
+class ContextGuideFusionModule(nn.Module):
+    def __init__(self, inc):
+        super().__init__()
+        self.adjust_conv  = nn.Identity()
+        if inc[0] != inc[1]:
+            self.adjust_conv = Conv(inc[0], inc[1], k = 1)
+
+        self.se = SEAttention(inc[1] * 2)
+
+
+    def forward(self, x):
+        x0, x1 = x;
+        x0 = self.adjust_conv(x0)
+
+        x_concat = torch.cat([x0, x1], dim = 1);
+        x_concat = self.se(x_concat)
+        x0_weight, x1_weight = torch.split(x_concat, [x0.size()[1], x1.size()[1]], dim = 1)
+
+        x0_weight = x0 * x0_weight
+        x1_weight = x1 * x1_weight
+
+        return torch.cat([x0 * x1_weight, x1*x0_weight], dim = 1)

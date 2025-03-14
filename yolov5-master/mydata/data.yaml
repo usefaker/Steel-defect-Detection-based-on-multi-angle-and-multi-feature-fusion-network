@@ -1,4 +1,4 @@
-path: D:\yolov5-test\yolov5-master\yolov5-master\mydata
+path: D:\yolo\yolov5-end\yolov5-test\yolov5-master\yolov5-master\mydata
 train: images/train
 val: images/val
 
