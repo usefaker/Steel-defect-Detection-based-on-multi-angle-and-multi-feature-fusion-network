@@ -1236,8 +1236,12 @@ class C3_DBB(C3):
         c_ = int(c2 * e)  # hidden channels
         self.m = nn.Sequential(*(Bottleneck_DBB(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
 
+<<<<<<< HEAD
 
 # common.py
+=======
+  # common.py
+>>>>>>> 87e4f2be86676fc294cdfa9460958bb3d157f22d
 import torch.nn.functional as F
 
 
